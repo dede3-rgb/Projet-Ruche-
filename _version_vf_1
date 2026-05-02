@@ -1,0 +1,619 @@
+
+#include <DHT.h>
+#include <HX711.h>
+#include <Wire.h>
+#include <OneWire.h>
+#include "esp_sleep.h"
+#include "esp_task_wdt.h"
+#include "esp_wifi.h"
+#include "esp_bt.h"
+#include "driver/rtc_io.h"
+#include "driver/gpio.h"
+#include "driver/adc.h"
+#include "soc/rtc.h"
+#include "soc/rtc_cntl_reg.h"
+
+// ── Pins ──────────────────────────────────────────────────────
+#define LORA_RX_PIN 16
+#define LORA_TX_PIN 17
+#define LORA_BAUD 9600
+#define PIN_AM2302 23
+#define PIN_DHT2 25
+#define DHTTYPE DHT22
+#define DT_PIN 32
+#define SCK_PIN 33
+#define LUX_I2C_ADDR 0x23
+#define ONE_WIRE_BUS 26
+#define ONE_WIRE_BUS2 27
+#define BATTERY_PIN 36
+#define MOSFET_PIN 12
+#define BUZZER_PIN 4
+
+// ── Calibration HX711 ─────────────────────────────────────────
+#define FACTEUR_CALIBRATION 30006.67
+#define OFFSET_TARE 140891
+
+// ── Sleep ─────────────────────────────────────────────────────
+#define SLEEP_MINUTES 10
+#define SLEEP_US (SLEEP_MINUTES * 60ULL * 1000000ULL)
+
+// ── Delta ─────────────────────────────────────────────────────
+#define DELTA_POIDS_KG 0.05f
+#define DELTA_TEMP_C 0.5f
+
+// ── TTN ───────────────────────────────────────────────────────
+#define DEVEUI "70B3D57ED0075CD3"
+#define APPEUI "0000000000000000"
+#define APPKEY "3C3B69C4A80B9BBD7EE479FF3CFCD21F"
+
+// ── Power tuning ──────────────────────────────────────────────
+#define PRODUCTION_MODE false
+#define HX711_SAMPLES 8
+#define HEARTBEAT_EVERY_N 6
+
+// ── Serial macros ─────────────────────────────────────────────
+#if PRODUCTION_MODE
+#define LOG(x)
+#define LOGF(...)
+#else
+#define LOG(x) Serial.println(x)
+#define LOGF(...) Serial.printf(__VA_ARGS__)
+#endif
+
+// ── RTC memory ────────────────────────────────────────────────
+RTC_DATA_ATTR bool  rtcJoined  = false;
+RTC_DATA_ATTR uint32_t wakeCount = 0;
+RTC_DATA_ATTR float lastPoids  = -1.0f;
+RTC_DATA_ATTR float lastTemp   = -99.0f;
+RTC_DATA_ATTR float lastBat    = -1.0f;
+RTC_DATA_ATTR uint32_t skipCount = 0;
+RTC_DATA_ATTR uint32_t heartbeat = 0;
+// ROM DS18B20 mis en cache pour éviter une énumération à chaque réveil
+RTC_DATA_ATTR uint8_t ds1ROM[8] = {0};
+RTC_DATA_ATTR uint8_t ds2ROM[8] = {0};
+RTC_DATA_ATTR bool romsScanned = false;
+
+// ── Objects ───────────────────────────────────────────────────
+HardwareSerial LoRaSerial(2);
+DHT dht(PIN_AM2302, DHTTYPE);
+DHT dht2(PIN_DHT2, DHTTYPE);
+HX711 balance;
+OneWire ds(ONE_WIRE_BUS);
+OneWire ds2(ONE_WIRE_BUS2);
+
+// ================================================================
+// Disable unused peripherals
+// ================================================================
+void disableUnusedPeripherals() {
+    esp_wifi_stop();
+    esp_wifi_deinit();
+    esp_bt_controller_disable();
+    esp_bt_controller_deinit();
+    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+}
+
+// ================================================================
+// AT helper
+// ================================================================
+String sendAT(const char* cmd, uint32_t timeout = 3000) {
+    while (LoRaSerial.available()) LoRaSerial.read();
+    LOGF("[AT] >> %s\n", cmd);
+    LoRaSerial.println(cmd);
+    String response = "";
+    uint32_t t = millis();
+    while (millis() - t < timeout) {
+        esp_task_wdt_reset();
+        while (LoRaSerial.available()) response += (char)LoRaSerial.read();
+        if (response.indexOf("+ACK")              >= 0 ||
+            response.indexOf("+MSGHEX: Done")     >= 0 ||
+            response.indexOf("Network joined")    >= 0 ||
+            response.indexOf("Already joined")    >= 0 ||
+            response.indexOf("Joined already")    >= 0 ||
+            response.indexOf("+JOIN: Join failed") >= 0 ||
+            response.indexOf("+AT: OK")           >= 0 ||
+            response.indexOf("+LOWPOWER: WAKEUP") >= 0 ||
+            response.indexOf("ERROR")             >= 0) break;
+        delay(10);
+    }
+    response.trim();
+    LOGF("[AT] << %s\n", response.c_str());
+    return response;
+}
+
+// ================================================================
+// BH1750 — lecture puis Power Down immédiat
+// ================================================================
+uint16_t lireLuminosite() {
+    Wire.beginTransmission(LUX_I2C_ADDR);
+    Wire.write(0x10); // Continuous H-Resolution Mode
+    Wire.endTransmission();
+    delay(180); // 120 ms typ + marge
+    Wire.requestFrom(LUX_I2C_ADDR, 2);
+    uint16_t lux = 0;
+    if (Wire.available() >= 2) {
+        lux  = (uint16_t)Wire.read() << 8;
+        lux |= Wire.read();
+        lux  = lux / 1.2f;
+    }
+    // Power Down immédiat
+    Wire.beginTransmission(LUX_I2C_ADDR);
+    Wire.write(0x00);
+    Wire.endTransmission();
+    LOGF("[BH1750] Lux: %d\n", lux);
+    return lux;
+}
+
+// ================================================================
+// Battery — lecture ADC puis libération immédiate
+// ================================================================
+float lireBatterie() {
+    float v = (analogRead(BATTERY_PIN) / 4095.0f) * 3.3f * 2.0f;
+    // Libère l'ADC pour économiser ~2 mA
+    adc_power_release();
+    return v;
+}
+
+// ================================================================
+// DS18B20 — scan ROM unique et mise en cache RTC
+// ================================================================
+bool scanDS18B20ROMs() {
+    // Bus 1
+    ds.reset_search();
+    if (!ds.search(ds1ROM)) {
+        LOG("[DS18B20] Pas de ROM sur bus 1 !");
+        return false;
+    }
+    if (OneWire::crc8(ds1ROM, 7) != ds1ROM[7]) {
+        LOG("[DS18B20] CRC ROM bus 1 invalide !");
+        return false;
+    }
+    // Bus 2
+    ds2.reset_search();
+    if (!ds2.search(ds2ROM)) {
+        LOG("[DS18B20] Pas de ROM sur bus 2 !");
+        return false;
+    }
+    if (OneWire::crc8(ds2ROM, 7) != ds2ROM[7]) {
+        LOG("[DS18B20] CRC ROM bus 2 invalide !");
+        return false;
+    }
+    LOGF("[DS18B20] ROM1: %02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X\n",
+         ds1ROM[0],ds1ROM[1],ds1ROM[2],ds1ROM[3],
+         ds1ROM[4],ds1ROM[5],ds1ROM[6],ds1ROM[7]);
+    LOGF("[DS18B20] ROM2: %02X:%02X:%02X:%02X:%02X:%02X:%02X:%02X\n",
+         ds2ROM[0],ds2ROM[1],ds2ROM[2],ds2ROM[3],
+         ds2ROM[4],ds2ROM[5],ds2ROM[6],ds2ROM[7]);
+    return true;
+}
+
+// Lance la conversion sur les deux bus en parallèle (adressage ROM)
+void startDS18B20Conversion() {
+    if (!romsScanned) {
+        romsScanned = scanDS18B20ROMs();
+    }
+    // Lancement conversion — adressage ROM individuel
+    ds.reset();
+    ds.select(ds1ROM);
+    ds.write(0x44, 1); // parasitic power
+
+    ds2.reset();
+    ds2.select(ds2ROM);
+    ds2.write(0x44, 1);
+}
+
+// Lecture d'un DS18B20 avec validation CRC scratchpad
+float readDS18B20(OneWire& wire, uint8_t rom[8]) {
+    byte data[9];
+    wire.reset();
+    wire.select(rom);
+    wire.write(0xBE); // Read Scratchpad
+    for (int i = 0; i < 9; i++) data[i] = wire.read();
+
+    if (OneWire::crc8(data, 8) != data[8]) {
+        LOG("[DS18B20] CRC scratchpad invalide !");
+        return 0.0f;
+    }
+    int16_t raw = (data[1] << 8) | data[0];
+    // Vérification valeur plausible (-55 à +125 °C)
+    float t = raw / 16.0f;
+    if (t < -55.0f || t > 125.0f) {
+        LOGF("[DS18B20] Valeur hors plage : %.2f C\n", t);
+        return 0.0f;
+    }
+    return t;
+}
+
+// ================================================================
+// HX711 power-down : SCK HIGH >60 µs
+// ================================================================
+void powerDownHX711() {
+    pinMode(SCK_PIN, OUTPUT);
+    digitalWrite(SCK_PIN, HIGH);
+    delayMicroseconds(80);
+    // Laisser la pin en INPUT sans pull pour haute impédance
+    gpio_config_t cfg = {};
+    cfg.pin_bit_mask    = (1ULL << SCK_PIN);
+    cfg.mode            = GPIO_MODE_INPUT;
+    cfg.pull_up_en      = GPIO_PULLUP_DISABLE;
+    cfg.pull_down_en    = GPIO_PULLDOWN_DISABLE;
+    cfg.intr_type       = GPIO_INTR_DISABLE;
+    gpio_config(&cfg);
+}
+
+// ================================================================
+// preparePinsForSleep
+// ── Toutes les GPIO numériques → haute impédance via gpio_hold_en
+// ── La pin MOSFET (RTC GPIO) reste LOW et verrouillée via rtc_gpio_hold_en
+// ================================================================
+void preparePinsForSleep() {
+    // Liste de toutes les pins actives à isoler (hors MOSFET géré en RTC)
+    const gpio_num_t pins[] = {
+        (gpio_num_t)PIN_AM2302,
+        (gpio_num_t)PIN_DHT2,
+        (gpio_num_t)DT_PIN,
+        (gpio_num_t)SCK_PIN,
+        (gpio_num_t)ONE_WIRE_BUS,
+        (gpio_num_t)ONE_WIRE_BUS2,
+        GPIO_NUM_21,  // SDA
+        GPIO_NUM_22,  // SCL
+        (gpio_num_t)BUZZER_PIN,
+        (gpio_num_t)LORA_TX_PIN,
+        (gpio_num_t)LORA_RX_PIN,
+    };
+
+    gpio_config_t cfg = {};
+    cfg.mode         = GPIO_MODE_INPUT;
+    cfg.pull_up_en   = GPIO_PULLUP_DISABLE;
+    cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    cfg.intr_type    = GPIO_INTR_DISABLE;
+    cfg.pin_bit_mask = 0;
+    for (auto p : pins) cfg.pin_bit_mask |= (1ULL << p);
+    gpio_config(&cfg);
+
+    // Verrouillage haute impédance pendant deep sleep (digital domain)
+    for (auto p : pins) gpio_hold_en(p);
+    gpio_deep_sleep_hold_en();
+
+    // ── MOSFET (GPIO 12 = RTC GPIO) : maintenu LOW pendant sleep ──
+    digitalWrite(MOSFET_PIN, LOW);
+    rtc_gpio_init((gpio_num_t)MOSFET_PIN);
+    rtc_gpio_set_direction((gpio_num_t)MOSFET_PIN, RTC_GPIO_MODE_OUTPUT_ONLY);
+    rtc_gpio_set_level((gpio_num_t)MOSFET_PIN, 0);
+    rtc_gpio_hold_en((gpio_num_t)MOSFET_PIN);
+}
+
+// ================================================================
+// restorePinsAfterSleep — appelé au début de setup()
+// ================================================================
+void restorePinsAfterSleep() {
+    // Libère les verrouillages RTC et digital
+    rtc_gpio_hold_dis((gpio_num_t)MOSFET_PIN);
+    rtc_gpio_deinit((gpio_num_t)MOSFET_PIN);
+    gpio_deep_sleep_hold_dis();
+
+    const gpio_num_t pins[] = {
+        (gpio_num_t)PIN_AM2302,
+        (gpio_num_t)PIN_DHT2,
+        (gpio_num_t)DT_PIN,
+        (gpio_num_t)SCK_PIN,
+        (gpio_num_t)ONE_WIRE_BUS,
+        (gpio_num_t)ONE_WIRE_BUS2,
+        GPIO_NUM_21,
+        GPIO_NUM_22,
+        (gpio_num_t)BUZZER_PIN,
+        (gpio_num_t)LORA_TX_PIN,
+        (gpio_num_t)LORA_RX_PIN,
+    };
+    for (auto p : pins) gpio_hold_dis(p);
+}
+
+// ================================================================
+// loraLowPower — met le module LoRa-E5 en veille profonde
+// AT+LOWPOWER=65535 : veille maximale (~1 µA, oscillateur interne OFF)
+// AT+UART=TIMEOUT,0 : désactive le timeout UART pour éviter les
+//   réveils parasites sur bruit de ligne
+// ================================================================
+void loraLowPower() {
+    LoRaSerial.flush();
+    // Désactive le timeout UART interne du module
+    sendAT("AT+UART=TIMEOUT,0", 1000);
+    // Veille profonde maximale
+    String resp = sendAT("AT+LOWPOWER=65535", 3000);
+    if (resp.indexOf("+LOWPOWER: SLEEP") >= 0 || resp.indexOf("OK") >= 0) {
+        LOG("[LoRa-E5] Module en veille profonde (AT+LOWPOWER=65535 OK)");
+    } else {
+        LOG("[LoRa-E5] AT+LOWPOWER : pas de confirmation (ignoré)");
+    }
+    delay(50);
+}
+
+// ================================================================
+// goToSleep
+// ================================================================
+void goToSleep() {
+    // 0. Coupure alimentation capteurs (MOSFET OFF)
+    digitalWrite(MOSFET_PIN, LOW);
+    LOG("[GT1168] Power switch OFF (GPIO 12)");
+
+    // 1. HX711 en veille
+    powerDownHX711();
+
+    // 2. Libération bus I2C
+    Wire.end();
+
+    // 3. LoRa-E5 en veille profonde (oscillateur interne OFF)
+    loraLowPower();
+
+    // 4. Isolation GPIO + verrouillage MOSFET pour deep sleep
+    preparePinsForSleep();
+
+    // 5. Fermeture UART LoRa
+    LoRaSerial.flush();
+    LoRaSerial.end();
+    LOG("[LoRa] UART off, pins isolées");
+
+    // 6. Durée de sleep adaptative selon tension batterie
+    //    Lecture batterie APRÈS isolation des autres périphériques
+    adc_power_acquire(); // nécessaire après adc_power_release()
+    float bv = lireBatterie(); // inclut adc_power_release()
+    uint64_t sleepTime = SLEEP_US;
+    if (bv < 3.3f) {
+        sleepTime = SLEEP_US * 6;
+        LOG("[BAT] Critique -> sleep 60 min");
+    } else if (bv < 3.6f) {
+        sleepTime = SLEEP_US * 3;
+        LOG("[BAT] Faible -> sleep 30 min");
+    } else {
+        LOGF("[BAT] OK -> sleep %d min\n", SLEEP_MINUTES);
+    }
+
+    // 7. Arrêt Serial debug
+#if !PRODUCTION_MODE
+    Serial.flush();
+    Serial.end();
+#endif
+
+    // 8. Stabilisation registres
+    delay(20);
+
+    // 9. WDT + deep sleep
+    esp_task_wdt_delete(NULL);
+    esp_sleep_enable_timer_wakeup(sleepTime);
+    esp_deep_sleep_start();
+}
+
+void printWakeReason() {
+    esp_sleep_wakeup_cause_t cause = esp_sleep_get_wakeup_cause();
+    switch (cause) {
+        case ESP_SLEEP_WAKEUP_TIMER:     LOG(" Cause reveil : TIMER");          break;
+        case ESP_SLEEP_WAKEUP_UNDEFINED: LOG(" Cause reveil : POWER ON / RESET"); break;
+        default: LOGF(" Cause reveil : autre (%d)\n", cause);                  break;
+    }
+}
+
+// ================================================================
+// SETUP
+// ================================================================
+void setup() {
+    disableUnusedPeripherals();
+    setCpuFrequencyMhz(20); // Fréquence basse pendant init et lecture capteurs
+
+    const esp_task_wdt_config_t wdt_config = {
+        .timeout_ms    = 60000,
+        .idle_core_mask = 0,
+        .trigger_panic  = false
+    };
+    esp_task_wdt_reconfigure(&wdt_config);
+    esp_task_wdt_add(NULL);
+
+#if !PRODUCTION_MODE
+    Serial.begin(115200);
+#endif
+
+    // ── Restauration des pins après deep sleep ────────────────
+    restorePinsAfterSleep();
+
+    pinMode(MOSFET_PIN, OUTPUT);
+    pinMode(BUZZER_PIN, OUTPUT);
+    delay(100);
+    digitalWrite(MOSFET_PIN, HIGH); // Alimentation capteurs
+
+#if !PRODUCTION_MODE
+    digitalWrite(BUZZER_PIN, HIGH);
+    delay(100);
+    digitalWrite(BUZZER_PIN, LOW);
+#endif
+
+    delay(200);
+    analogReadResolution(12);
+    analogSetAttenuation(ADC_11db);
+    pinMode(13, INPUT_PULLUP);
+    pinMode(14, INPUT_PULLUP);
+
+    wakeCount++;
+    heartbeat++;
+
+    LOG("\n╔══════════════════════════════════════════════════════╗");
+    LOG("║ ESP32 BEEP — RUCHE Y2 — OpenRUSH                    ║");
+    LOG("╚══════════════════════════════════════════════════════╝");
+    LOGF(" Reveil #%lu\n", wakeCount);
+    printWakeReason();
+
+    LoRaSerial.begin(LORA_BAUD, SERIAL_8N1, LORA_RX_PIN, LORA_TX_PIN);
+    delay(3000);
+    while (LoRaSerial.available()) LoRaSerial.read();
+
+    // ── Réveil LoRa-E5 depuis AT+LOWPOWER ────────────────────
+    // Le premier "AT" réveille le module (répond +LOWPOWER: WAKEUP)
+    for (int i = 0; i < 5; i++) {
+        sendAT("AT", 1000);
+        delay(500);
+        esp_task_wdt_reset();
+    }
+    while (LoRaSerial.available()) LoRaSerial.read();
+    esp_task_wdt_reset();
+
+    // ── STEP 1 — DS18B20 : lancement conversion en parallèle ───
+    // I2C nécessaire avant pour OneWire — initialisation d'abord
+    Wire.begin(21, 22);
+    Wire.setClock(400000); // Fast Mode — réduit le temps de bus I2C
+    startDS18B20Conversion();
+    uint32_t ds18_start = millis();
+    esp_task_wdt_reset();
+
+    // ── STEP 2 — DHTs ─────────────────────────────────────────
+    dht.begin();
+    dht2.begin();
+    esp_task_wdt_reset();
+
+    // ── STEP 3 — Battery + Lux ────────────────────────────────
+    adc_power_acquire();
+    float battery_voltage = lireBatterie(); // inclut adc_power_release()
+    int battery_percent = constrain(
+        map((long)(battery_voltage * 100), 300, 420, 0, 100), 0, 100);
+    LOGF("[BAT] Batterie : %.2f V (%d%%)\n", battery_voltage, battery_percent);
+
+    uint16_t lux = lireLuminosite();
+    esp_task_wdt_reset();
+
+    // ── STEP 4 — HX711 ────────────────────────────────────────
+    balance.begin(DT_PIN, SCK_PIN);
+    esp_task_wdt_reset();
+
+    // Attente fin conversion DS18B20 (750 ms min, on attend 2 s)
+    uint32_t elapsed = millis() - ds18_start;
+    if (elapsed < 2000) delay(2000 - elapsed);
+    esp_task_wdt_reset();
+
+    balance.set_offset(OFFSET_TARE);
+    balance.set_scale(FACTEUR_CALIBRATION);
+
+    float poids_kg = 0;
+    if (balance.is_ready()) {
+        poids_kg = balance.get_units(HX711_SAMPLES);
+        if (poids_kg < 0) poids_kg = 0;
+        LOGF("[HX711] Poids : %.2f kg\n", poids_kg);
+    } else {
+        LOG("[HX711] ERREUR !");
+    }
+    esp_task_wdt_reset();
+
+    // ── STEP 5 — DHTs ─────────────────────────────────────────
+    float temperature = NAN, humidity = NAN;
+    for (int i = 0; i < 3; i++) {
+        temperature = dht.readTemperature();
+        humidity    = dht.readHumidity();
+        if (!isnan(temperature) && !isnan(humidity)) break;
+        delay(300); esp_task_wdt_reset();
+    }
+    if (isnan(temperature) || isnan(humidity)) { temperature = 0; humidity = 0; }
+    LOGF("[AM2302] Temp. : %.1f C  Hum. : %.1f%%\n", temperature, humidity);
+
+    float temperature2 = NAN, humidity2 = NAN;
+    for (int i = 0; i < 3; i++) {
+        temperature2 = dht2.readTemperature();
+        humidity2    = dht2.readHumidity();
+        if (!isnan(temperature2) && !isnan(humidity2)) break;
+        delay(300); esp_task_wdt_reset();
+    }
+    if (isnan(temperature2) || isnan(humidity2)) { temperature2 = 0; humidity2 = 0; }
+    LOGF("[DHT22-2] Temp. : %.1f C  Hum. : %.1f%%\n", temperature2, humidity2);
+
+    // ── STEP 6 — DS18B20 : lecture résultats avec CRC ─────────
+    float tempDS1 = readDS18B20(ds,  ds1ROM);
+    float tempDS2 = readDS18B20(ds2, ds2ROM);
+    LOGF("[DS18B20-1] Temp. : %.2f C\n", tempDS1);
+    LOGF("[DS18B20-2] Temp. : %.2f C\n", tempDS2);
+    esp_task_wdt_reset();
+
+    // ── STEP 7 — Delta + heartbeat ────────────────────────────
+    bool significantChange =
+        (lastPoids < 0) ||
+        (fabsf(poids_kg     - lastPoids) > DELTA_POIDS_KG) ||
+        (fabsf(temperature  - lastTemp)  > DELTA_TEMP_C)   ||
+        (lastBat < 0) ||
+        (fabsf(battery_voltage - lastBat) > 0.1f);
+
+    bool heartbeatDue = (heartbeat >= HEARTBEAT_EVERY_N);
+
+    if (!significantChange && !heartbeatDue) {
+        skipCount++;
+        LOGF("[DELTA] Rien change — skip #%lu\n", skipCount);
+        goToSleep();
+    }
+
+    if (heartbeatDue) heartbeat = 0;
+    skipCount  = 0;
+    lastPoids  = poids_kg;
+    lastTemp   = temperature;
+    lastBat    = battery_voltage;
+
+    // ── STEP 8 — Build payload ────────────────────────────────
+    int16_t  t1Raw    = (int16_t) (temperature        * 10.0f);
+    uint16_t h1Raw    = (uint16_t)(humidity            * 10.0f);
+    int16_t  t2Raw    = (int16_t) (temperature2       * 10.0f);
+    uint16_t h2Raw    = (uint16_t)(humidity2           * 10.0f);
+    int16_t  ds1Raw   = (int16_t) (tempDS1             * 10.0f);
+    int16_t  ds2Raw   = (int16_t) (tempDS2             * 10.0f);
+    uint16_t luxRaw   = lux;
+    uint16_t poidsRaw = (uint16_t)(poids_kg            * 10.0f);
+    uint16_t batRaw   = (uint16_t)(battery_voltage     * 100.0f);
+
+    char payload[37];
+    snprintf(payload, sizeof(payload),
+        "%02X%02X%02X%02X%02X%02X%02X%02X"
+        "%02X%02X%02X%02X%02X%02X%02X%02X"
+        "%02X%02X",
+        (uint8_t)( t1Raw & 0xFF),  (uint8_t)(( t1Raw >> 8) & 0xFF),
+        (uint8_t)( h1Raw & 0xFF),  (uint8_t)(( h1Raw >> 8) & 0xFF),
+        (uint8_t)( t2Raw & 0xFF),  (uint8_t)(( t2Raw >> 8) & 0xFF),
+        (uint8_t)( h2Raw & 0xFF),  (uint8_t)(( h2Raw >> 8) & 0xFF),
+        (uint8_t)(ds1Raw & 0xFF),  (uint8_t)((ds1Raw >> 8) & 0xFF),
+        (uint8_t)(ds2Raw & 0xFF),  (uint8_t)((ds2Raw >> 8) & 0xFF),
+        (uint8_t)(luxRaw & 0xFF),  (uint8_t)((luxRaw >> 8) & 0xFF),
+        (uint8_t)(poidsRaw & 0xFF),(uint8_t)((poidsRaw >> 8) & 0xFF),
+        (uint8_t)( batRaw & 0xFF), (uint8_t)(( batRaw >> 8) & 0xFF));
+
+    LOGF("[Payload] HEX : %s\n", payload);
+
+    // ── STEP 9 — LoRa TX (CPU boost pour réduire temps d'antenne)
+    setCpuFrequencyMhz(40);
+
+    bool moduleOK = false;
+    for (int i = 0; i < 5; i++) {
+        esp_task_wdt_reset();
+        if (sendAT("AT", 2000).indexOf("+AT: OK") >= 0) { moduleOK = true; break; }
+        LOGF("[LoRa-E5] Tentative AT %d/5...\n", i + 1);
+        delay(500);
+    }
+    if (!moduleOK) { LOG("[LoRa-E5] PAS DE REPONSE AT !"); goToSleep(); }
+
+    if (!rtcJoined) {
+        LOG("[LoRa-E5] === JOIN OTAA ===");
+        sendAT(("AT+ID=DevEui,\"" + String(DEVEUI) + "\"").c_str()); delay(500); esp_task_wdt_reset();
+        sendAT(("AT+ID=AppEui,\"" + String(APPEUI) + "\"").c_str()); delay(500); esp_task_wdt_reset();
+        sendAT(("AT+KEY=AppKey,\"" + String(APPKEY) + "\"").c_str()); delay(500); esp_task_wdt_reset();
+        sendAT("AT+MODE=LWOTAA"); delay(500); esp_task_wdt_reset();
+        String resp = sendAT("AT+JOIN", 15000);
+        if (resp.indexOf("Network joined") < 0) { LOG("[LoRa-E5] JOIN ECHOUE"); goToSleep(); }
+        rtcJoined = true;
+        LOG("[LoRa-E5] JOIN OK !");
+    } else {
+        LOG("[LoRa-E5] Session active");
+    }
+
+    String msgCmd = String("AT+MSGHEX=\"") + payload + "\"";
+    String txResp = sendAT(msgCmd.c_str(), 10000);
+    if (txResp.indexOf("Done") >= 0) {
+        LOG("[LoRa-E5] Envoi OK !");
+    } else {
+        LOG("[LoRa-E5] Erreur TX — rejoin prochain reveil");
+        rtcJoined = false;
+    }
+    goToSleep();
+}
+
+void loop() {
+    esp_task_wdt_reset();
+    delay(100);
+}
